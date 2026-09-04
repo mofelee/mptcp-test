@@ -1,5 +1,151 @@
-# Two Debian 13 hosts with two isolated MPTCP data paths.
-# Libvirt owns link bandwidth; DebianForm owns all guest configuration.
+# Two Debian 13 hosts with two isolated WireGuard-backed MPTCP data paths.
+# Libvirt owns underlay bandwidth; DebianForm owns all guest configuration.
+
+variable "client_wg_a_public_key" {
+  type     = string
+  nullable = false
+}
+
+variable "client_wg_b_public_key" {
+  type     = string
+  nullable = false
+}
+
+variable "server_wg_a_public_key" {
+  type     = string
+  nullable = false
+}
+
+variable "server_wg_b_public_key" {
+  type     = string
+  nullable = false
+}
+
+component "wireguard_path" {
+  input "private_key_source" {
+    type      = string
+    sensitive = true
+  }
+
+  input "name" {
+    type     = string
+    nullable = false
+  }
+
+  input "address" {
+    type     = string
+    nullable = false
+  }
+
+  input "listen_port" {
+    type     = number
+    nullable = false
+  }
+
+  input "peer_public_key" {
+    type     = string
+    nullable = false
+  }
+
+  input "peer_allowed_ip" {
+    type     = string
+    nullable = false
+  }
+
+  input "peer_endpoint" {
+    type     = string
+    nullable = false
+  }
+
+  script "activate" {
+    mode = "once"
+
+    content = <<-EOF
+      set -eu
+      networkctl reload
+      networkctl reconfigure ${input.name}
+      wg set ${input.name} private-key /etc/wireguard/${input.name}.key
+      if test -x /usr/local/sbin/mptcp-lab-setup; then
+        /usr/local/sbin/mptcp-lab-setup
+      fi
+    EOF
+  }
+
+  files {
+    file "private_key" {
+      path      = "/etc/wireguard/${input.name}.key"
+      source    = input.private_key_source
+      sensitive = true
+      owner     = "root"
+      group     = "systemd-network"
+      mode      = "0640"
+      on_change = script.activate
+    }
+  }
+
+  systemd {
+    networkd {
+      enable = true
+
+      netdev "wireguard" {
+        path  = "/etc/systemd/network/30-${input.name}.netdev"
+        group = "systemd-network"
+        mode  = "0640"
+
+        section "identity" {
+          name = "NetDev"
+          settings = {
+            Name     = input.name
+            Kind     = "wireguard"
+            MTUBytes = 1420
+          }
+        }
+        section "wireguard" {
+          name = "WireGuard"
+          settings = {
+            ListenPort     = input.listen_port
+            PrivateKeyFile = "/etc/wireguard/${input.name}.key"
+            RouteTable     = "off"
+          }
+        }
+        section "peer" {
+          name = "WireGuardPeer"
+          settings = {
+            PublicKey           = input.peer_public_key
+            AllowedIPs          = [input.peer_allowed_ip]
+            Endpoint            = input.peer_endpoint
+            PersistentKeepalive = 5
+          }
+        }
+        activation {
+          post_reload = script.activate
+        }
+      }
+
+      network "wireguard" {
+        path = "/etc/systemd/network/40-${input.name}.network"
+
+        section "match" {
+          name     = "Match"
+          settings = { Name = input.name }
+        }
+        section "network" {
+          name = "Network"
+          settings = {
+            Address             = input.address
+            DHCP                = "no"
+            IPv6AcceptRA        = false
+            LinkLocalAddressing = "no"
+          }
+        }
+        activation {
+          reconfigure = [input.name]
+          post_reload = script.activate
+        }
+      }
+    }
+  }
+}
 
 script "reconfigure_client_data_links" {
   mode = "once"
@@ -80,6 +226,17 @@ host "client" {
     package "mptcpize" {
       conffile_policy = "keep"
     }
+    package "wireguard-tools" {
+      conffile_policy = "keep"
+    }
+  }
+
+  directories {
+    directory "/etc/wireguard" {
+      owner = "root"
+      group = "systemd-network"
+      mode  = "0750"
+    }
   }
 
   files {
@@ -106,11 +263,39 @@ host "client" {
           done
         }
 
-        wait_for_address 10.203.1.1
-        wait_for_address 10.203.2.1
+        wait_for_address 10.204.1.1
+        wait_for_address 10.204.2.1
         ip mptcp endpoint flush
         ip mptcp limits set subflow 1 add_addr_accepted 1
       EOF
+    }
+  }
+
+  component "wg_a" {
+    source = component.wireguard_path
+
+    inputs = {
+      private_key_source = "${path.module}/.lab/wireguard/client-wg-a.key"
+      name               = "wg-a"
+      address            = "10.204.1.1/30"
+      listen_port        = 51820
+      peer_public_key    = var.server_wg_a_public_key
+      peer_allowed_ip    = "10.204.1.2/32"
+      peer_endpoint      = "10.203.1.2:51820"
+    }
+  }
+
+  component "wg_b" {
+    source = component.wireguard_path
+
+    inputs = {
+      private_key_source = "${path.module}/.lab/wireguard/client-wg-b.key"
+      name               = "wg-b"
+      address            = "10.204.2.1/30"
+      listen_port        = 51821
+      peer_public_key    = var.server_wg_b_public_key
+      peer_allowed_ip    = "10.204.2.2/32"
+      peer_endpoint      = "10.203.2.2:51821"
     }
   }
 
@@ -241,6 +426,17 @@ host "server" {
     package "mptcpize" {
       conffile_policy = "keep"
     }
+    package "wireguard-tools" {
+      conffile_policy = "keep"
+    }
+  }
+
+  directories {
+    directory "/etc/wireguard" {
+      owner = "root"
+      group = "systemd-network"
+      mode  = "0750"
+    }
   }
 
   files {
@@ -267,14 +463,40 @@ host "server" {
           done
         }
 
-        wait_for_address 10.203.1.2
-        wait_for_address 10.203.2.2
+        wait_for_address 10.204.1.2
+        wait_for_address 10.204.2.2
         ip mptcp endpoint flush
         ip mptcp limits set subflow 1 add_addr_accepted 0
-        interface="$(ip -o route get 10.203.2.1 from 10.203.2.2 | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
-        test -n "$interface"
-        ip mptcp endpoint add 10.203.2.2 dev "$interface" id 1 signal
+        ip mptcp endpoint add 10.204.2.2 dev wg-b id 2 signal
       EOF
+    }
+  }
+
+  component "wg_a" {
+    source = component.wireguard_path
+
+    inputs = {
+      private_key_source = "${path.module}/.lab/wireguard/server-wg-a.key"
+      name               = "wg-a"
+      address            = "10.204.1.2/30"
+      listen_port        = 51820
+      peer_public_key    = var.client_wg_a_public_key
+      peer_allowed_ip    = "10.204.1.1/32"
+      peer_endpoint      = "10.203.1.1:51820"
+    }
+  }
+
+  component "wg_b" {
+    source = component.wireguard_path
+
+    inputs = {
+      private_key_source = "${path.module}/.lab/wireguard/server-wg-b.key"
+      name               = "wg-b"
+      address            = "10.204.2.2/30"
+      listen_port        = 51821
+      peer_public_key    = var.client_wg_b_public_key
+      peer_allowed_ip    = "10.204.2.1/32"
+      peer_endpoint      = "10.203.2.1:51821"
     }
   }
 

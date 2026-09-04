@@ -10,6 +10,8 @@ KNOWN_HOSTS="$RUNTIME_DIR/known_hosts"
 DBF_HOME="$RUNTIME_DIR/home"
 OWNERSHIP_FILE="$RUNTIME_DIR/ownership.json"
 LOCK_FILE="$ROOT_DIR/.mptcp-lab.lock"
+WIREGUARD_DIR="$RUNTIME_DIR/wireguard"
+WIREGUARD_VAR_FILE="$WIREGUARD_DIR/public-keys.dbfvars.json"
 
 SKILL_SCRIPT="${VIRSH_TEST_HOST_SCRIPT:-/root/.codex/skills/virsh-test-host/scripts/virsh-test-host.sh}"
 LIBVIRT_URI="${DBF_LIBVIRT_URI:-${VIRSH_DEFAULT_CONNECT_URI:-${LIBVIRT_DEFAULT_URI:-}}}"
@@ -31,6 +33,16 @@ SERVER_LINK_A_MAC="52:54:00:ca:02:01"
 SERVER_LINK_B_MAC="52:54:00:cb:02:01"
 BANDWIDTH="12500,12500,1250"
 BANDWIDTH_AVERAGE="12500"
+CLIENT_UNDERLAY_A="10.203.1.1"
+SERVER_UNDERLAY_A="10.203.1.2"
+CLIENT_UNDERLAY_B="10.203.2.1"
+SERVER_UNDERLAY_B="10.203.2.2"
+CLIENT_WG_A="10.204.1.1"
+SERVER_WG_A="10.204.1.2"
+CLIENT_WG_B="10.204.2.1"
+SERVER_WG_B="10.204.2.2"
+WG_A_INTERFACE="wg-a"
+WG_B_INTERFACE="wg-b"
 CLIENT_RESTART_REQUIRED=0
 SERVER_RESTART_REQUIRED=0
 CANONICAL_URI=""
@@ -38,6 +50,7 @@ POOL_UUID=""
 POOL_TARGET_PATH=""
 MANAGEMENT_NETWORK_UUID=""
 VERIFY_PID=""
+MEASURED_BASELINE_BPS=""
 
 log() {
   printf '[mptcp-lab] %s\n' "$*"
@@ -103,6 +116,80 @@ private_key_file() {
   else
     die "set DBF_TEST_SSH_PRIVATE_KEY_FILE"
   fi
+}
+
+ensure_wireguard_private_key() {
+  local path=$1
+  local temporary
+  [[ ! -L "$path" ]] || die "refusing symlinked WireGuard private key: $path"
+  if [[ ! -e "$path" ]]; then
+    temporary="$(mktemp "$WIREGUARD_DIR/.private-key.XXXXXX")"
+    chmod 0600 "$temporary"
+    if ! wg genkey >"$temporary"; then
+      rm -f -- "$temporary"
+      die "failed to generate WireGuard private key"
+    fi
+    mv -- "$temporary" "$path"
+  fi
+  [[ -f "$path" && ! -L "$path" ]] || die "invalid WireGuard private key path: $path"
+  chmod 0600 "$path"
+  wg pubkey <"$path" >/dev/null || die "invalid WireGuard private key: $path"
+}
+
+wireguard_public_key() {
+  local path=$1
+  local public_key
+  public_key="$(wg pubkey <"$path")" || die "failed to derive WireGuard public key"
+  [[ "$public_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "invalid derived WireGuard public key"
+  printf '%s\n' "$public_key"
+}
+
+ensure_wireguard_keys() {
+  local client_a_public client_b_public server_a_public server_b_public
+  require_command wg
+  [[ ! -L "$WIREGUARD_DIR" && ! -L "$WIREGUARD_VAR_FILE" ]] || \
+    die "refusing symlinked WireGuard runtime path"
+  mkdir -p "$WIREGUARD_DIR"
+  chmod 0700 "$WIREGUARD_DIR"
+
+  ensure_wireguard_private_key "$WIREGUARD_DIR/client-wg-a.key"
+  ensure_wireguard_private_key "$WIREGUARD_DIR/client-wg-b.key"
+  ensure_wireguard_private_key "$WIREGUARD_DIR/server-wg-a.key"
+  ensure_wireguard_private_key "$WIREGUARD_DIR/server-wg-b.key"
+  client_a_public="$(wireguard_public_key "$WIREGUARD_DIR/client-wg-a.key")"
+  client_b_public="$(wireguard_public_key "$WIREGUARD_DIR/client-wg-b.key")"
+  server_a_public="$(wireguard_public_key "$WIREGUARD_DIR/server-wg-a.key")"
+  server_b_public="$(wireguard_public_key "$WIREGUARD_DIR/server-wg-b.key")"
+
+  python3 - "$WIREGUARD_VAR_FILE" \
+    "$client_a_public" "$client_b_public" "$server_a_public" "$server_b_public" <<'PY'
+import json
+import os
+import sys
+
+path, client_a, client_b, server_a, server_b = sys.argv[1:]
+payload = {
+    "client_wg_a_public_key": client_a,
+    "client_wg_b_public_key": client_b,
+    "server_wg_a_public_key": server_a,
+    "server_wg_b_public_key": server_b,
+}
+temporary = f"{path}.tmp.{os.getpid()}"
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+fd = os.open(temporary, flags, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+  chmod 0600 "$WIREGUARD_VAR_FILE"
+  log "WireGuard test keys are ready in the ignored runtime directory"
 }
 
 validate_environment() {
@@ -385,7 +472,7 @@ print_selection() {
   log "pool: $POOL"
   log "management network: $MANAGEMENT_NETWORK"
   log "domains: $CLIENT_VM, $SERVER_VM"
-  log "data networks: $LINK_A_NETWORK, $LINK_B_NETWORK"
+  log "WireGuard underlay networks: $LINK_A_NETWORK, $LINK_B_NETWORK"
   log "per-interface limit: 100 Mbit/s in each direction"
 }
 
@@ -788,19 +875,33 @@ refresh_access() {
 }
 
 apply_lab() {
-  local dbf_bin artifact_dir
+  local dbf_bin artifact_dir host key status
   assert_complete_ownership
+  ensure_wireguard_keys
   refresh_access
   dbf_bin="$(build_dbf)"
   artifact_dir="$ARTIFACT_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-apply"
   mkdir -p "$artifact_dir"
   "$dbf_bin" version | tee "$artifact_dir/dbf-version.txt"
-  dbf_cmd "$dbf_bin" validate -f "$ROOT_DIR/lab.dbf.hcl"
-  dbf_cmd "$dbf_bin" plan -f "$ROOT_DIR/lab.dbf.hcl" --color never | tee "$artifact_dir/plan.txt"
-  dbf_cmd "$dbf_bin" apply -f "$ROOT_DIR/lab.dbf.hcl" --auto-approve --parallel 2 --color never | tee "$artifact_dir/apply.txt"
-  ssh_host mptcp-client 'systemctl restart mptcp-lab-setup.service'
-  ssh_host mptcp-server 'systemctl restart mptcp-lab-setup.service'
-  dbf_cmd "$dbf_bin" check -f "$ROOT_DIR/lab.dbf.hcl" --color never | tee "$artifact_dir/check.txt"
+  dbf_cmd "$dbf_bin" validate -f "$ROOT_DIR/lab.dbf.hcl" -var-file "$WIREGUARD_VAR_FILE"
+  dbf_cmd "$dbf_bin" plan -f "$ROOT_DIR/lab.dbf.hcl" -var-file "$WIREGUARD_VAR_FILE" --color never | tee "$artifact_dir/plan.txt"
+  dbf_cmd "$dbf_bin" apply -f "$ROOT_DIR/lab.dbf.hcl" -var-file "$WIREGUARD_VAR_FILE" --auto-approve --parallel 2 --color never | tee "$artifact_dir/apply.txt"
+  dbf_cmd "$dbf_bin" check -f "$ROOT_DIR/lab.dbf.hcl" -var-file "$WIREGUARD_VAR_FILE" --color never | tee "$artifact_dir/check.txt"
+  for key in "$WIREGUARD_DIR"/*.key; do
+    if grep -R -F -q -f "$key" "$artifact_dir"; then
+      die "a WireGuard private key leaked into DebianForm artifacts"
+    fi
+  done
+  for host in mptcp-client mptcp-server; do
+    for key in "$WIREGUARD_DIR"/*.key; do
+      if ssh_host "$host" 'grep -R -F -q -f - /var/lib/debianform/state' <"$key"; then
+        die "a WireGuard private key leaked into remote DebianForm state"
+      else
+        status=$?
+        (( status == 1 )) || die "failed to scan remote DebianForm state for private-key leakage"
+      fi
+    done
+  done
   log "DebianForm artifacts: $artifact_dir"
 }
 
@@ -848,20 +949,46 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 PY
 }
 
-extract_mptcp_data_meta() {
+assert_iperf_connection() {
   python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+path, expected_local, expected_remote = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    result = json.load(stream)
+connections = result.get("start", {}).get("connected", [])
+if len(connections) != 1:
+    raise SystemExit(f"expected one iperf data connection, found {len(connections)}")
+connection = connections[0]
+observed = (str(connection.get("local_host")), str(connection.get("remote_host")))
+expected = (expected_local, expected_remote)
+if observed != expected:
+    raise SystemExit(f"iperf data connection is {observed}, expected {expected}")
+PY
+}
+
+extract_mptcp_data_meta() {
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import json
 import re
 import sys
 from pathlib import Path
 
-iperf_path, samples_path, output_path = map(Path, sys.argv[1:])
+iperf_path, samples_path, output_path = map(Path, sys.argv[1:4])
+expected_local, expected_remote = sys.argv[4:6]
 with iperf_path.open(encoding="utf-8") as stream:
     iperf = json.load(stream)
 connections = iperf.get("start", {}).get("connected", [])
 if len(connections) != 1:
     raise SystemExit(f"expected one iperf data connection, found {len(connections)}")
 connection = connections[0]
+observed_hosts = (str(connection["local_host"]), str(connection["remote_host"]))
+if observed_hosts != (expected_local, expected_remote):
+    raise SystemExit(
+        f"MPTCP initial path is {observed_hosts}, expected "
+        f"{(expected_local, expected_remote)}"
+    )
 expected = (
     str(connection["local_host"]),
     int(connection["local_port"]),
@@ -940,6 +1067,109 @@ link_tx_sample() {
   ssh_host "$host" "interface=\$(ip -o -4 route get $destination from $source | sed -n 's/.* dev \([^ ]*\).*/\1/p'); test -n \"\$interface\"; printf '%s ' \"\$interface\"; cat \"/sys/class/net/\$interface/statistics/tx_bytes\""
 }
 
+wireguard_tx_sample() {
+  local host=$1
+  local interface=$2
+  ssh_host "$host" "wg show $interface transfer | awk 'NF == 3 { count += 1; sent += \$3 } END { if (count != 1) exit 1; print sent }'"
+}
+
+interface_tx_sample() {
+  local host=$1
+  local interface=$2
+  ssh_host "$host" "cat /sys/class/net/$interface/statistics/tx_bytes"
+}
+
+wireguard_safe_snapshot() {
+  local host=$1
+  ssh_host "$host" 'set -eu
+    for interface in wg-a wg-b; do
+      printf "[%s]\n" "$interface"
+      wg show "$interface" public-key
+      wg show "$interface" listen-port
+      wg show "$interface" endpoints
+      wg show "$interface" allowed-ips
+      wg show "$interface" latest-handshakes
+      wg show "$interface" transfer
+    done'
+}
+
+measure_tcp_baseline() {
+  local label=$1
+  local client_address=$2
+  local server_address=$3
+  local selected_wg=$4
+  local other_wg=$5
+  local selected_outer=$6
+  local other_outer=$7
+  local json_file=$8
+  local counter_file=$9
+  local selected_wg_before selected_wg_after selected_outer_before selected_outer_after
+  local other_wg_before other_wg_after other_outer_before other_outer_after
+  local selected_wg_delta selected_outer_delta other_wg_delta other_outer_delta
+  local sent_bytes minimum_selected maximum_noise
+
+  selected_wg_before="$(wireguard_tx_sample mptcp-client "$selected_wg")"
+  other_wg_before="$(wireguard_tx_sample mptcp-client "$other_wg")"
+  selected_outer_before="$(interface_tx_sample mptcp-client "$selected_outer")"
+  other_outer_before="$(interface_tx_sample mptcp-client "$other_outer")"
+  log "measuring plain TCP through $label"
+  ssh_host mptcp-client \
+    "iperf3 --version4 --client $server_address --bind $client_address%$selected_wg --port 5201 --parallel 1 --time 20 --omit 2 --json" \
+    >"$json_file"
+  assert_iperf_connection "$json_file" "$client_address" "$server_address"
+  selected_wg_after="$(wireguard_tx_sample mptcp-client "$selected_wg")"
+  other_wg_after="$(wireguard_tx_sample mptcp-client "$other_wg")"
+  selected_outer_after="$(interface_tx_sample mptcp-client "$selected_outer")"
+  other_outer_after="$(interface_tx_sample mptcp-client "$other_outer")"
+  (( selected_wg_after >= selected_wg_before )) || die "$label $selected_wg TX counter decreased"
+  (( other_wg_after >= other_wg_before )) || die "$label $other_wg TX counter decreased"
+  (( selected_outer_after >= selected_outer_before )) || die "$label $selected_outer TX counter decreased"
+  (( other_outer_after >= other_outer_before )) || die "$label $other_outer TX counter decreased"
+  selected_wg_delta=$((selected_wg_after - selected_wg_before))
+  other_wg_delta=$((other_wg_after - other_wg_before))
+  selected_outer_delta=$((selected_outer_after - selected_outer_before))
+  other_outer_delta=$((other_outer_after - other_outer_before))
+  sent_bytes="$(iperf_sent_bytes "$json_file")"
+  minimum_selected=$((sent_bytes * 8 / 10))
+  (( minimum_selected >= 10485760 )) || minimum_selected=10485760
+  maximum_noise=$((2 * 1024 * 1024))
+  (( selected_wg_delta >= minimum_selected )) || die "$label WireGuard counter carried too little baseline traffic"
+  (( selected_outer_delta >= minimum_selected )) || die "$label underlay carried too little baseline traffic"
+  (( other_wg_delta <= maximum_noise )) || die "$label baseline leaked onto $other_wg"
+  (( other_outer_delta <= maximum_noise )) || die "$label baseline leaked onto $other_outer"
+
+  cat >"$counter_file" <<EOF
+selected WireGuard interface: $selected_wg
+selected WireGuard TX delta: $selected_wg_delta
+selected underlay interface: $selected_outer
+selected underlay TX delta: $selected_outer_delta
+other WireGuard interface: $other_wg
+other WireGuard TX delta: $other_wg_delta
+other underlay interface: $other_outer
+other underlay TX delta: $other_outer_delta
+minimum selected delta: $minimum_selected
+maximum other-path noise: $maximum_noise
+EOF
+  MEASURED_BASELINE_BPS="$(iperf_bits_per_second "$json_file")"
+}
+
+assert_wireguard_peer() {
+  local host=$1
+  local interface=$2
+  local interface_public_key=$3
+  local peer_public_key=$4
+  local endpoint=$5
+  local allowed_ip=$6
+  assert_guest "$host" "$interface has the expected WireGuard peer and a recent handshake" \
+    "set -eu
+     test \"\$(wg show $interface public-key)\" = '$interface_public_key'
+     set -- \$(wg show $interface peers); test \"\$#\" -eq 1; test \"\$1\" = '$peer_public_key'
+     set -- \$(wg show $interface endpoints); test \"\$#\" -eq 2; test \"\$1\" = '$peer_public_key'; test \"\$2\" = '$endpoint'
+     set -- \$(wg show $interface allowed-ips); test \"\$#\" -eq 2; test \"\$1\" = '$peer_public_key'; test \"\$2\" = '$allowed_ip'
+     set -- \$(wg show $interface latest-handshakes); test \"\$#\" -eq 2; test \"\$1\" = '$peer_public_key'; test \"\$2\" -gt 0
+     now=\$(date +%s); age=\$((now - \$2)); test \"\$age\" -ge 0; test \"\$age\" -le 180"
+}
+
 nstat_value() {
   local host=$1
   local name=$2
@@ -971,9 +1201,17 @@ verify_lab() {
   local artifact_dir baseline_a_json baseline_b_json mptcp_json meta_samples meta_json
   local baseline_a baseline_b baseline_fast mptcp_bps mptcp_bytes ratio
   local join_before join_after join_delta fallback_before fallback_after
-  local link_a_interface link_b_interface interface_after
-  local link_a_before link_a_after link_a_delta link_b_before link_b_after link_b_delta minimum_link_bytes
+  local underlay_a_interface underlay_b_interface interface_after initial_counter
+  local wg_a_before wg_a_after wg_a_delta wg_b_before wg_b_after wg_b_delta
+  local underlay_a_before underlay_a_after underlay_a_delta
+  local underlay_b_before underlay_b_after underlay_b_delta minimum_link_bytes
   local data_meta_token data_subflows sampled_bytes
+  local client_wg_a_public client_wg_b_public server_wg_a_public server_wg_b_public
+  ensure_wireguard_keys
+  client_wg_a_public="$(wireguard_public_key "$WIREGUARD_DIR/client-wg-a.key")"
+  client_wg_b_public="$(wireguard_public_key "$WIREGUARD_DIR/client-wg-b.key")"
+  server_wg_a_public="$(wireguard_public_key "$WIREGUARD_DIR/server-wg-a.key")"
+  server_wg_b_public="$(wireguard_public_key "$WIREGUARD_DIR/server-wg-b.key")"
   assert_complete_ownership
   refresh_access
   artifact_dir="$ARTIFACT_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-verify"
@@ -981,13 +1219,30 @@ verify_lab() {
 
   assert_guest mptcp-client "client is Debian 13" ". /etc/os-release; test \"\$ID\" = debian && test \"\$VERSION_ID\" = 13"
   assert_guest mptcp-server "server is Debian 13" ". /etc/os-release; test \"\$ID\" = debian && test \"\$VERSION_ID\" = 13"
-  assert_guest mptcp-client "client data addresses are configured" "ip -4 addr show to 10.203.1.1/30 | grep -q . && ip -4 addr show to 10.203.2.1/30 | grep -q ."
-  assert_guest mptcp-server "server data addresses are configured" "ip -4 addr show to 10.203.1.2/30 | grep -q . && ip -4 addr show to 10.203.2.2/30 | grep -q ."
+  assert_guest mptcp-client "client underlay and WireGuard addresses are configured" \
+    "ip -4 addr show to $CLIENT_UNDERLAY_A/30 | grep -q . && ip -4 addr show to $CLIENT_UNDERLAY_B/30 | grep -q . && ip -4 addr show dev $WG_A_INTERFACE to $CLIENT_WG_A/30 | grep -q . && ip -4 addr show dev $WG_B_INTERFACE to $CLIENT_WG_B/30 | grep -q ."
+  assert_guest mptcp-server "server underlay and WireGuard addresses are configured" \
+    "ip -4 addr show to $SERVER_UNDERLAY_A/30 | grep -q . && ip -4 addr show to $SERVER_UNDERLAY_B/30 | grep -q . && ip -4 addr show dev $WG_A_INTERFACE to $SERVER_WG_A/30 | grep -q . && ip -4 addr show dev $WG_B_INTERFACE to $SERVER_WG_B/30 | grep -q ."
   assert_guest mptcp-client "client MPTCP is enabled" "test \"\$(sysctl -n net.mptcp.enabled)\" = 1 && systemctl is-active --quiet mptcp-lab-setup.service"
-  assert_guest mptcp-server "server MPTCP endpoint advertises link-b" "ip mptcp endpoint show | grep -Eq '10\\.203\\.2\\.2.*signal' && systemctl is-active --quiet mptcp-lab-setup.service"
+  assert_guest mptcp-client "client has no explicit management or underlay MPTCP endpoint" \
+    "set -eu
+     endpoints=\$(ip mptcp endpoint show)
+     printf '%s\\n' \"\$endpoints\" | awk '
+       NF {
+         if (NF != 4 || (\$1 != \"10.204.1.1\" && \$1 != \"10.204.2.1\") ||
+             \$2 != \"id\" || \$3 !~ /^[0-9]+\$/ || \$4 != \"implicit\" || ++seen[\$1] > 1) {
+           exit 1
+         }
+       }'"
+  assert_guest mptcp-server "server advertises only WireGuard link-b" \
+    "endpoints=\$(ip mptcp endpoint show); printf '%s\\n' \"\$endpoints\" | grep -Eq '^10\\.204\\.2\\.2 id 2 signal dev wg-b$'; test \"\$(printf '%s\\n' \"\$endpoints\" | awk 'NF { count++ } END { print count + 0 }')\" -eq 1; systemctl is-active --quiet mptcp-lab-setup.service"
   assert_guest mptcp-server "both iperf3 services are active" "systemctl is-active --quiet iperf3-tcp.service && systemctl is-active --quiet iperf3-mptcp.service"
-  assert_guest mptcp-client "link-a is reachable" "ping -I 10.203.1.1 -c 2 -W 2 10.203.1.2"
-  assert_guest mptcp-client "link-b is reachable" "ping -I 10.203.2.1 -c 2 -W 2 10.203.2.2"
+  assert_guest mptcp-client "WireGuard link-a is reachable" "ping -I $WG_A_INTERFACE -c 2 -W 2 $SERVER_WG_A"
+  assert_guest mptcp-client "WireGuard link-b is reachable" "ping -I $WG_B_INTERFACE -c 2 -W 2 $SERVER_WG_B"
+  assert_wireguard_peer mptcp-client "$WG_A_INTERFACE" "$client_wg_a_public" "$server_wg_a_public" "$SERVER_UNDERLAY_A:51820" "$SERVER_WG_A/32"
+  assert_wireguard_peer mptcp-client "$WG_B_INTERFACE" "$client_wg_b_public" "$server_wg_b_public" "$SERVER_UNDERLAY_B:51821" "$SERVER_WG_B/32"
+  assert_wireguard_peer mptcp-server "$WG_A_INTERFACE" "$server_wg_a_public" "$client_wg_a_public" "$CLIENT_UNDERLAY_A:51820" "$CLIENT_WG_A/32"
+  assert_wireguard_peer mptcp-server "$WG_B_INTERFACE" "$server_wg_b_public" "$client_wg_b_public" "$CLIENT_UNDERLAY_B:51821" "$CLIENT_WG_B/32"
 
   assert_bandwidth "$CLIENT_VM" "$CLIENT_LINK_A_MAC" "$artifact_dir/client-link-a-domiftune.txt"
   assert_bandwidth "$CLIENT_VM" "$CLIENT_LINK_B_MAC" "$artifact_dir/client-link-b-domiftune.txt"
@@ -995,8 +1250,26 @@ verify_lab() {
   assert_bandwidth "$SERVER_VM" "$SERVER_LINK_B_MAC" "$artifact_dir/server-link-b-domiftune.txt"
   log "assert: all four data interfaces have 100 Mbit/s bidirectional limits"
 
+  read -r underlay_a_interface initial_counter < <(link_tx_sample mptcp-client "$SERVER_UNDERLAY_A" "$CLIENT_UNDERLAY_A")
+  read -r underlay_b_interface initial_counter < <(link_tx_sample mptcp-client "$SERVER_UNDERLAY_B" "$CLIENT_UNDERLAY_B")
+  [[ "$underlay_a_interface" != "$underlay_b_interface" ]] || die "both WireGuard underlays use $underlay_a_interface"
+  [[ "$underlay_a_interface" != "$WG_A_INTERFACE" && "$underlay_a_interface" != "$WG_B_INTERFACE" ]] || die "link-a endpoint route is not on a physical underlay"
+  [[ "$underlay_b_interface" != "$WG_A_INTERFACE" && "$underlay_b_interface" != "$WG_B_INTERFACE" ]] || die "link-b endpoint route is not on a physical underlay"
+  assert_guest mptcp-client "WireGuard link-a maps to the shaped link-a MAC" \
+    "test \"\$(cat /sys/class/net/$underlay_a_interface/address)\" = '$CLIENT_LINK_A_MAC'"
+  assert_guest mptcp-client "WireGuard link-b maps to the shaped link-b MAC" \
+    "test \"\$(cat /sys/class/net/$underlay_b_interface/address)\" = '$CLIENT_LINK_B_MAC'"
+
   ssh_host mptcp-client 'ip -brief address; ip route; ip mptcp limits show; ip mptcp endpoint show' >"$artifact_dir/client-network.txt"
   ssh_host mptcp-server 'ip -brief address; ip route; ip mptcp limits show; ip mptcp endpoint show' >"$artifact_dir/server-network.txt"
+  ssh_host mptcp-client \
+    "ip -4 route get $SERVER_WG_A from $CLIENT_WG_A; ip -4 route get $SERVER_WG_B from $CLIENT_WG_B; ip -4 route get $SERVER_UNDERLAY_A from $CLIENT_UNDERLAY_A; ip -4 route get $SERVER_UNDERLAY_B from $CLIENT_UNDERLAY_B; ip -o link show" \
+    >"$artifact_dir/client-path-routes.txt"
+  wireguard_safe_snapshot mptcp-client >"$artifact_dir/client-wireguard-before.txt"
+  wireguard_safe_snapshot mptcp-server >"$artifact_dir/server-wireguard-before.txt"
+  ssh_host mptcp-client '. /etc/os-release; printf "distribution=%s version=%s\\n" "$ID" "$VERSION_ID"; uname -srvo; wg --version; iperf3 --version | head -2' >"$artifact_dir/client-environment.txt"
+  ssh_host mptcp-server '. /etc/os-release; printf "distribution=%s version=%s\\n" "$ID" "$VERSION_ID"; uname -srvo; wg --version; iperf3 --version | head -2' >"$artifact_dir/server-environment.txt"
+  sha256sum "$ROOT_DIR/lab.dbf.hcl" "$ROOT_DIR/scripts/lab.sh" >"$artifact_dir/configuration-sha256.txt"
   for domain in "$CLIENT_VM" "$SERVER_VM"; do
     virsh_cmd domiflist "$domain" >"$artifact_dir/$domain-interfaces.txt"
   done
@@ -1006,21 +1279,26 @@ verify_lab() {
   mptcp_json="$artifact_dir/mptcp.json"
   meta_samples="$artifact_dir/mptcp-meta-samples.txt"
   meta_json="$artifact_dir/mptcp-data-meta.json"
-  log "measuring plain TCP on link-a"
-  ssh_host mptcp-client 'iperf3 --version4 --client 10.203.1.2 --port 5201 --parallel 1 --time 20 --omit 2 --json' >"$baseline_a_json"
-  log "measuring plain TCP on link-b"
-  ssh_host mptcp-client 'iperf3 --version4 --client 10.203.2.2 --port 5201 --parallel 1 --time 20 --omit 2 --json' >"$baseline_b_json"
-  baseline_a="$(iperf_bits_per_second "$baseline_a_json")"
-  baseline_b="$(iperf_bits_per_second "$baseline_b_json")"
+  measure_tcp_baseline "WireGuard link-a" "$CLIENT_WG_A" "$SERVER_WG_A" \
+    "$WG_A_INTERFACE" "$WG_B_INTERFACE" "$underlay_a_interface" "$underlay_b_interface" \
+    "$baseline_a_json" "$artifact_dir/tcp-link-a-isolation.txt"
+  baseline_a="$MEASURED_BASELINE_BPS"
+  measure_tcp_baseline "WireGuard link-b" "$CLIENT_WG_B" "$SERVER_WG_B" \
+    "$WG_B_INTERFACE" "$WG_A_INTERFACE" "$underlay_b_interface" "$underlay_a_interface" \
+    "$baseline_b_json" "$artifact_dir/tcp-link-b-isolation.txt"
+  baseline_b="$MEASURED_BASELINE_BPS"
 
-  read -r link_a_interface link_a_before < <(link_tx_sample mptcp-client 10.203.1.2 10.203.1.1)
-  read -r link_b_interface link_b_before < <(link_tx_sample mptcp-client 10.203.2.2 10.203.2.1)
-  [[ "$link_a_interface" != "$link_b_interface" ]] || die "both data routes use $link_a_interface"
+  wg_a_before="$(wireguard_tx_sample mptcp-client "$WG_A_INTERFACE")"
+  wg_b_before="$(wireguard_tx_sample mptcp-client "$WG_B_INTERFACE")"
+  underlay_a_before="$(interface_tx_sample mptcp-client "$underlay_a_interface")"
+  underlay_b_before="$(interface_tx_sample mptcp-client "$underlay_b_interface")"
   ssh_host mptcp-client 'nstat -asz | sed -n "/^MPTcpExt/p"' >"$artifact_dir/client-mptcp-counters-before.txt"
   join_before="$(nstat_value mptcp-client MPTcpExtMPJoinSynTx)"
   fallback_before="$(mptcp_fallback_count mptcp-client)"
-  log "measuring one MPTCP flow across both links"
-  ssh_host mptcp-client 'mptcpize run iperf3 --version4 --client 10.203.1.2 --port 5202 --parallel 1 --time 30 --omit 3 --json' >"$mptcp_json" &
+  log "measuring one MPTCP flow across both WireGuard links"
+  ssh_host mptcp-client \
+    "mptcpize run iperf3 --version4 --client $SERVER_WG_A --port 5202 --parallel 1 --time 30 --omit 3 --json" \
+    >"$mptcp_json" &
   VERIFY_PID=$!
   trap cleanup_verify_process EXIT
   trap 'exit 130' INT
@@ -1030,7 +1308,8 @@ verify_lab() {
     sleep 1
     printf '%s\n' "--- sample $(date -u +%Y-%m-%dT%H:%M:%SZ) ---" >>"$meta_samples"
     ssh_host mptcp-client "ss -H -MnOi state established '( dport = :5202 )'" >>"$meta_samples" || true
-    ssh_host mptcp-server 'ss -Mnti; printf "\n--- TCP subflows ---\n"; ss -H -nti state established' >"$artifact_dir/socket-sample.txt" || true
+    printf '%s\n' "--- sample $(date -u +%Y-%m-%dT%H:%M:%SZ) ---" >>"$artifact_dir/socket-samples-server.txt"
+    ssh_host mptcp-server 'ss -MnOi' >>"$artifact_dir/socket-samples-server.txt" || true
   done
   wait "$VERIFY_PID"
   VERIFY_PID=""
@@ -1041,13 +1320,23 @@ verify_lab() {
   join_delta=$((join_after - join_before))
   mptcp_bps="$(iperf_bits_per_second "$mptcp_json")"
   mptcp_bytes="$(iperf_sent_bytes "$mptcp_json")"
-  read -r data_meta_token data_subflows sampled_bytes < <(extract_mptcp_data_meta "$mptcp_json" "$meta_samples" "$meta_json")
-  read -r interface_after link_a_after < <(link_tx_sample mptcp-client 10.203.1.2 10.203.1.1)
-  [[ "$interface_after" == "$link_a_interface" ]] || die "link-a route changed during verification"
-  read -r interface_after link_b_after < <(link_tx_sample mptcp-client 10.203.2.2 10.203.2.1)
-  [[ "$interface_after" == "$link_b_interface" ]] || die "link-b route changed during verification"
-  link_a_delta=$((link_a_after - link_a_before))
-  link_b_delta=$((link_b_after - link_b_before))
+  read -r data_meta_token data_subflows sampled_bytes < <(
+    extract_mptcp_data_meta "$mptcp_json" "$meta_samples" "$meta_json" "$CLIENT_WG_A" "$SERVER_WG_A"
+  )
+  wg_a_after="$(wireguard_tx_sample mptcp-client "$WG_A_INTERFACE")"
+  wg_b_after="$(wireguard_tx_sample mptcp-client "$WG_B_INTERFACE")"
+  read -r interface_after underlay_a_after < <(link_tx_sample mptcp-client "$SERVER_UNDERLAY_A" "$CLIENT_UNDERLAY_A")
+  [[ "$interface_after" == "$underlay_a_interface" ]] || die "link-a underlay route changed during verification"
+  read -r interface_after underlay_b_after < <(link_tx_sample mptcp-client "$SERVER_UNDERLAY_B" "$CLIENT_UNDERLAY_B")
+  [[ "$interface_after" == "$underlay_b_interface" ]] || die "link-b underlay route changed during verification"
+  (( wg_a_after >= wg_a_before )) || die "$WG_A_INTERFACE TX counter decreased during MPTCP verification"
+  (( wg_b_after >= wg_b_before )) || die "$WG_B_INTERFACE TX counter decreased during MPTCP verification"
+  (( underlay_a_after >= underlay_a_before )) || die "$underlay_a_interface TX counter decreased during MPTCP verification"
+  (( underlay_b_after >= underlay_b_before )) || die "$underlay_b_interface TX counter decreased during MPTCP verification"
+  wg_a_delta=$((wg_a_after - wg_a_before))
+  wg_b_delta=$((wg_b_after - wg_b_before))
+  underlay_a_delta=$((underlay_a_after - underlay_a_before))
+  underlay_b_delta=$((underlay_b_after - underlay_b_before))
   minimum_link_bytes=$((mptcp_bytes / 10))
   (( minimum_link_bytes >= 10485760 )) || minimum_link_bytes=10485760
 
@@ -1071,37 +1360,53 @@ if mptcp < 150_000_000:
     raise SystemExit(f"MPTCP throughput below 150 Mbit/s: {mptcp / 1e6:.2f}")
 if mptcp < fastest * 1.5:
     raise SystemExit(f"MPTCP gain below 1.5x: {mptcp / fastest:.2f}x")
+if mptcp > 230_000_000:
+    raise SystemExit(f"MPTCP throughput unexpectedly exceeds two shaped paths: {mptcp / 1e6:.2f}")
 PY
   (( data_subflows == 2 )) || die "the iperf3 data connection did not have exactly two MPTCP subflows"
   (( sampled_bytes >= 1048576 )) || die "the sampled MPTCP data connection carried too little data"
-  (( link_a_delta >= minimum_link_bytes )) || die "link-a carried too little MPTCP traffic: $link_a_delta bytes"
-  (( link_b_delta >= minimum_link_bytes )) || die "link-b carried too little MPTCP traffic: $link_b_delta bytes"
+  (( wg_a_delta >= minimum_link_bytes )) || die "wg-a carried too little MPTCP traffic: $wg_a_delta bytes"
+  (( wg_b_delta >= minimum_link_bytes )) || die "wg-b carried too little MPTCP traffic: $wg_b_delta bytes"
+  (( underlay_a_delta >= minimum_link_bytes )) || die "link-a underlay carried too little MPTCP traffic: $underlay_a_delta bytes"
+  (( underlay_b_delta >= minimum_link_bytes )) || die "link-b underlay carried too little MPTCP traffic: $underlay_b_delta bytes"
   (( join_delta >= 1 )) || die "no new MP_JOIN was observed"
   (( fallback_after == fallback_before )) || die "an MPTCP fallback was observed"
 
   cat >"$artifact_dir/client-link-tx-bytes.txt" <<EOF
-link-a interface: $link_a_interface
-link-a before:    $link_a_before
-link-a after:     $link_a_after
-link-a delta:     $link_a_delta
-link-b interface: $link_b_interface
-link-b before:    $link_b_before
-link-b after:     $link_b_after
-link-b delta:     $link_b_delta
-minimum delta:    $minimum_link_bytes
+wg-a transfer TX before: $wg_a_before
+wg-a transfer TX after:  $wg_a_after
+wg-a transfer TX delta:  $wg_a_delta
+wg-b transfer TX before: $wg_b_before
+wg-b transfer TX after:  $wg_b_after
+wg-b transfer TX delta:  $wg_b_delta
+link-a underlay interface: $underlay_a_interface
+link-a underlay TX before: $underlay_a_before
+link-a underlay TX after:  $underlay_a_after
+link-a underlay TX delta:  $underlay_a_delta
+link-b underlay interface: $underlay_b_interface
+link-b underlay TX before: $underlay_b_before
+link-b underlay TX after:  $underlay_b_after
+link-b underlay TX delta:  $underlay_b_delta
+minimum per-path delta:    $minimum_link_bytes
 EOF
 
+  wireguard_safe_snapshot mptcp-client >"$artifact_dir/client-wireguard-after.txt"
+  wireguard_safe_snapshot mptcp-server >"$artifact_dir/server-wireguard-after.txt"
+
   cat >"$artifact_dir/summary.txt" <<EOF
-link-a TCP: $(python3 -c "print(f'{$baseline_a / 1000000:.2f} Mbit/s')")
-link-b TCP: $(python3 -c "print(f'{$baseline_b / 1000000:.2f} Mbit/s')")
-MPTCP:       $(python3 -c "print(f'{$mptcp_bps / 1000000:.2f} Mbit/s')")
-gain:        ${ratio}x
-data token:  $data_meta_token
+WireGuard link-a TCP: $(python3 -c "print(f'{$baseline_a / 1000000:.2f} Mbit/s')")
+WireGuard link-b TCP: $(python3 -c "print(f'{$baseline_b / 1000000:.2f} Mbit/s')")
+WireGuard MPTCP:       $(python3 -c "print(f'{$mptcp_bps / 1000000:.2f} Mbit/s')")
+gain over fastest link: ${ratio}x
+initial data path: $CLIENT_WG_A -> $SERVER_WG_A
+data token: $data_meta_token
 data subflows_total: $data_subflows
 MP_JOIN (host-global): +$join_delta
-link-a TX:   +$link_a_delta bytes
-link-b TX:   +$link_b_delta bytes
-fallback:    +$((fallback_after - fallback_before))
+wg-a transfer TX: +$wg_a_delta bytes
+wg-b transfer TX: +$wg_b_delta bytes
+link-a underlay TX: +$underlay_a_delta bytes
+link-b underlay TX: +$underlay_b_delta bytes
+fallback: +$((fallback_after - fallback_before))
 EOF
   cat "$artifact_dir/summary.txt"
   log "verification artifacts: $artifact_dir"
@@ -1145,7 +1450,7 @@ status_lab() {
       virsh_cmd domiflist "$domain"
     fi
   done
-  printf '\n[data interface bandwidth]\n'
+  printf '\n[underlay interface bandwidth]\n'
   for pair in \
     "$CLIENT_VM $CLIENT_LINK_A_MAC" \
     "$CLIENT_VM $CLIENT_LINK_B_MAC" \
@@ -1161,8 +1466,16 @@ status_lab() {
     refresh_access
     printf '\n[client]\n'
     ssh_host mptcp-client 'ip -brief -4 address; ip mptcp limits show; ip mptcp endpoint show'
+    if ssh_host mptcp-client 'command -v wg >/dev/null && ip link show wg-a >/dev/null 2>&1 && ip link show wg-b >/dev/null 2>&1'; then
+      printf '\n[client WireGuard]\n'
+      wireguard_safe_snapshot mptcp-client
+    fi
     printf '\n[server]\n'
     ssh_host mptcp-server 'ip -brief -4 address; ip mptcp limits show; ip mptcp endpoint show'
+    if ssh_host mptcp-server 'command -v wg >/dev/null && ip link show wg-a >/dev/null 2>&1 && ip link show wg-b >/dev/null 2>&1'; then
+      printf '\n[server WireGuard]\n'
+      wireguard_safe_snapshot mptcp-server
+    fi
   fi
 }
 
